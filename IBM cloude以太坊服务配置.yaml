@@ -1,0 +1,570 @@
+# ibm-deployment/ibm-resources.yaml
+# IBM Cloud Schematics Workspace Configuration
+
+terraform:
+  required_version: '>= 1.0'
+  
+  required_providers:
+    ibm:
+      source: 'IBM-Cloud/ibm'
+      version: '~> 1.46.0'
+    kubernetes:
+      source: 'hashicorp/kubernetes'
+      version: '~> 2.16.0'
+    helm:
+      source: 'hashicorp/helm'
+      version: '~> 2.9.0'
+
+provider:
+  ibm:
+    region: 'us-south'
+    ibmcloud_api_key: '${var.ibmcloud_api_key}'
+  
+  kubernetes:
+    config_path: '${var.kube_config_path}'
+  
+  helm:
+    kubernetes:
+      config_path: '${var.kube_config_path}'
+
+variable:
+  ibmcloud_api_key:
+    type: string
+    description: 'IBM Cloud API Key'
+    sensitive: true
+  
+  resource_group:
+    type: string
+    default: 'default'
+    description: 'Resource Group Name'
+  
+  cluster_name:
+    type: string
+    default: 'casino-ethereum-cluster'
+    description: 'Kubernetes Cluster Name'
+  
+  kube_config_path:
+    type: string
+    default: '~/.kube/config'
+    description: 'Kubernetes Config Path'
+  
+  eth_node_count:
+    type: number
+    default: 3
+    description: 'Number of Ethereum nodes'
+  
+  contract_owner_address:
+    type: string
+    description: 'Ethereum contract owner address'
+
+resource:
+  # 1. 创建Kubernetes集群
+  ibm_container_vpc_cluster:
+    casino_cluster:
+      name: '${var.cluster_name}'
+      vpc_id: data.ibm_is_vpc.default.id
+      flavor: 'bx2.4x16'
+      worker_count: 3
+      resource_group_id: data.ibm_resource_group.default.id
+      zones: [
+        {
+          name: 'us-south-1',
+          subnet_id: data.ibm_is_subnet.zone1.id
+        },
+        {
+          name: 'us-south-2',
+          subnet_id: data.ibm_is_subnet.zone2.id
+        },
+        {
+          name: 'us-south-3',
+          subnet_id: data.ibm_is_subnet.zone3.id
+        }
+      ]
+      kube_version: '1.27'
+      cos_instance_crn: data.ibm_resource_instance.cos.id
+      entitlement: 'cloud_pak'
+  
+  # 2. 创建以太坊节点部署
+  kubernetes_deployment:
+    ethereum_nodes:
+      count: var.eth_node_count
+      
+      metadata:
+        name: 'ethereum-node'
+        namespace: 'casino-namespace'
+        labels:
+          app: 'ethereum'
+          component: 'node'
+      
+      spec:
+        replicas: var.eth_node_count
+        
+        selector:
+          match_labels:
+            app: 'ethereum'
+            component: 'node'
+        
+        template:
+          metadata:
+            labels:
+              app: 'ethereum'
+              component: 'node'
+          
+          spec:
+            containers:
+            - name: 'geth'
+              image: 'ethereum/client-go:stable'
+              image_pull_policy: 'Always'
+              
+              ports:
+              - container_port: 8545
+                name: 'http-rpc'
+              - container_port: 8546
+                name: 'ws-rpc'
+              - container_port: 30303
+                name: 'p2p'
+              
+              env:
+              - name: 'NETWORK_ID'
+                value: '123456'
+              - name: 'SYNC_MODE'
+                value: 'full'
+              - name: 'HTTP_API'
+                value: 'eth,net,web3,personal,admin'
+              - name: 'WS_API'
+                value: 'eth,net,web3,personal,admin'
+              - name: 'ALLOW_INSECURE_UNLOCK'
+                value: 'true'
+              
+              volume_mounts:
+              - name: 'ethereum-data'
+                mount_path: '/root/.ethereum'
+              
+              resources:
+                requests:
+                  memory: '4Gi'
+                  cpu: '2000m'
+                limits:
+                  memory: '8Gi'
+                  cpu: '4000m'
+              
+              command:
+              - '/bin/sh'
+              - '-c'
+              - |
+                geth \
+                  --datadir /root/.ethereum \
+                  --networkid $${NETWORK_ID} \
+                  --syncmode $${SYNC_MODE} \
+                  --http \
+                  --http.addr 0.0.0.0 \
+                  --http.port 8545 \
+                  --http.api $${HTTP_API} \
+                  --http.corsdomain "*" \
+                  --ws \
+                  --ws.addr 0.0.0.0 \
+                  --ws.port 8546 \
+                  --ws.api $${WS_API} \
+                  --ws.origins "*" \
+                  --allow-insecure-unlock \
+                  --rpc.allow-unprotected-txs \
+                  --verbosity 3 \
+                  --mine \
+                  --miner.etherbase ${var.contract_owner_address} \
+                  --miner.gasprice 0 \
+                  --miner.threads 2
+          
+            volumes:
+            - name: 'ethereum-data'
+              persistent_volume_claim:
+                claim_name: 'ethereum-pvc'
+    
+    # 3. 创建智能合约部署器
+    contract_deployer:
+      metadata:
+        name: 'contract-deployer'
+        namespace: 'casino-namespace'
+      
+      spec:
+        replicas: 1
+        
+        selector:
+          match_labels:
+            app: 'ethereum'
+            component: 'deployer'
+        
+        template:
+          metadata:
+            labels:
+              app: 'ethereum'
+              component: 'deployer'
+          
+          spec:
+            containers:
+            - name: 'deployer'
+              image: 'node:18-alpine'
+              image_pull_policy: 'Always'
+              
+              env:
+              - name: 'NODE_URL'
+                value: 'http://ethereum-service:8545'
+              - name: 'OWNER_ADDRESS'
+                value: var.contract_owner_address
+              - name: 'OWNER_PRIVATE_KEY'
+                value_from:
+                  secret_key_ref:
+                    name: 'ethereum-secrets'
+                    key: 'owner_private_key'
+              
+              volume_mounts:
+              - name: 'contract-files'
+                mount_path: '/app/contracts'
+              - name: 'deploy-scripts'
+                mount_path: '/app/scripts'
+              
+              command:
+              - 'sh'
+              - '-c'
+              - |
+                apk add --no-cache python3 make g++ git
+                npm install -g truffle @truffle/hdwallet-provider
+                cd /app
+                npm install
+                npx truffle migrate --network ibm
+          
+            volumes:
+            - name: 'contract-files'
+              config_map:
+                name: 'casino-contract'
+            - name: 'deploy-scripts'
+              config_map:
+                name: 'deployment-scripts'
+    
+    # 4. 创建API服务
+    casino_api:
+      metadata:
+        name: 'casino-api'
+        namespace: 'casino-namespace'
+        labels:
+          app: 'casino'
+          component: 'api'
+      
+      spec:
+        replicas: 3
+        
+        selector:
+          match_labels:
+            app: 'casino'
+            component: 'api'
+        
+        template:
+          metadata:
+            labels:
+              app: 'casino'
+              component: 'api'
+          
+          spec:
+            containers:
+            - name: 'api'
+              image: 'casino-api:latest'
+              image_pull_policy: 'Always'
+              
+              ports:
+              - container_port: 3000
+                name: 'http'
+              
+              env:
+              - name: 'NODE_ENV'
+                value: 'production'
+              - name: 'ETH_NODE_URL'
+                value: 'http://ethereum-service:8545'
+              - name: 'CONTRACT_ADDRESS'
+                value_from:
+                  config_map_key_ref:
+                    name: 'casino-config'
+                    key: 'contract_address'
+              - name: 'DATABASE_URL'
+                value_from:
+                  secret_key_ref:
+                    name: 'postgres-secrets'
+                    key: 'url'
+              
+              resources:
+                requests:
+                  memory: '512Mi'
+                  cpu: '250m'
+                limits:
+                  memory: '1Gi'
+                  cpu: '500m'
+              
+              liveness_probe:
+                http_get:
+                  path: '/health'
+                  port: 3000
+                initial_delay_seconds: 30
+                period_seconds: 10
+              
+              readiness_probe:
+                http_get:
+                  path: '/ready'
+                  port: 3000
+                initial_delay_seconds: 5
+                period_seconds: 5
+  
+  # 5. 创建服务发现
+  kubernetes_service:
+    ethereum_service:
+      metadata:
+        name: 'ethereum-service'
+        namespace: 'casino-namespace'
+      
+      spec:
+        selector:
+          app: 'ethereum'
+          component: 'node'
+        
+        ports:
+        - name: 'http-rpc'
+          port: 8545
+          target_port: 8545
+          protocol: 'TCP'
+        - name: 'ws-rpc'
+          port: 8546
+          target_port: 8546
+          protocol: 'TCP'
+        
+        type: 'ClusterIP'
+    
+    casino_api_service:
+      metadata:
+        name: 'casino-api-service'
+        namespace: 'casino-namespace'
+      
+      spec:
+        selector:
+          app: 'casino'
+          component: 'api'
+        
+        ports:
+        - port: 80
+          target_port: 3000
+          protocol: 'TCP'
+        
+        type: 'LoadBalancer'
+  
+  # 6. 创建Ingress路由
+  kubernetes_ingress:
+    casino_ingress:
+      metadata:
+        name: 'casino-ingress'
+        namespace: 'casino-namespace'
+        annotations:
+          'ingress.bluemix.net/client-max-body-size': 'size=20m'
+          'ingress.bluemix.net/proxy-connect-timeout': 'timeout=30s'
+          'ingress.bluemix.net/proxy-read-timeout': 'timeout=30s'
+      
+      spec:
+        rules:
+        - host: 'casino.${var.cluster_name}.us-south.containers.appdomain.cloud'
+          http:
+            paths:
+            - path: '/api'
+              path_type: 'Prefix'
+              backend:
+                service:
+                  name: 'casino-api-service'
+                  port:
+                    number: 80
+            - path: '/'
+              path_type: 'Prefix'
+              backend:
+                service:
+                  name: 'casino-web-service'
+                  port:
+                    number: 80
+  
+  # 7. 创建ConfigMap和Secrets
+  kubernetes_config_map:
+    casino_contract:
+      metadata:
+        name: 'casino-contract'
+        namespace: 'casino-namespace'
+      
+      data:
+        'Casino.sol': |
+          // SPDX-License-Identifier: MIT
+          pragma solidity ^0.8.19;
+          
+          import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+          import "@openzeppelin/contracts/access/Ownable.sol";
+          
+          contract Casino is ReentrancyGuard, Ownable {
+              struct Bet {
+                  address player;
+                  uint256 number;
+                  uint256 amount;
+                  uint256 timestamp;
+              }
+              
+              uint256 public constant MAX_BETS = 100;
+              uint256 public constant MIN_NUMBER = 1;
+              uint256 public constant MAX_NUMBER = 10;
+              uint256 public constant HOUSE_FEE_PERCENT = 5;
+              
+              Bet[] public bets;
+              uint256 public totalPrizePool;
+              uint256 public roundId;
+              bool public isRoundActive;
+              
+              event BetPlaced(
+                  address indexed player,
+                  uint256 roundId,
+                  uint256 number,
+                  uint256 amount,
+                  uint256 betIndex
+              );
+              
+              constructor() {
+                  roundId = 1;
+                  isRoundActive = true;
+              }
+              
+              function placeBet(uint256 _number) external payable nonReentrant {
+                  require(isRoundActive, "Round not active");
+                  require(_number >= MIN_NUMBER && _number <= MAX_NUMBER, "Invalid number");
+                  require(msg.value > 0, "Bet amount must be greater than 0");
+                  require(bets.length < MAX_BETS, "Max bets reached");
+                  
+                  bets.push(Bet({
+                      player: msg.sender,
+                      number: _number,
+                      amount: msg.value,
+                      timestamp: block.timestamp
+                  }));
+                  
+                  totalPrizePool += msg.value;
+                  emit BetPlaced(msg.sender, roundId, _number, msg.value, bets.length - 1);
+                  
+                  if (bets.length == MAX_BETS) {
+                      _completeRound();
+                  }
+              }
+              
+              function _completeRound() private {
+                  uint256 winningNumber = _generateRandomNumber();
+                  uint256 houseFee = (totalPrizePool * HOUSE_FEE_PERCENT) / 100;
+                  uint256 prizePool = totalPrizePool - houseFee;
+                  
+                  uint256 totalWinningAmount = 0;
+                  address[] memory winners = new address[](MAX_BETS);
+                  uint256 winnerCount = 0;
+                  
+                  for (uint256 i = 0; i < bets.length; i++) {
+                      if (bets[i].number == winningNumber) {
+                          winners[winnerCount] = bets[i].player;
+                          totalWinningAmount += bets[i].amount;
+                          winnerCount++;
+                      }
+                  }
+                  
+                  if (winnerCount > 0 && prizePool > 0) {
+                      for (uint256 i = 0; i < winnerCount; i++) {
+                          uint256 playerBetAmount = _getPlayerBetAmount(winners[i], winningNumber);
+                          uint256 prizeAmount = (playerBetAmount * prizePool) / totalWinningAmount;
+                          payable(winners[i]).transfer(prizeAmount);
+                      }
+                  }
+                  
+                  if (houseFee > 0) {
+                      payable(owner()).transfer(houseFee);
+                  }
+                  
+                  _startNewRound();
+              }
+              
+              function _getPlayerBetAmount(address player, uint256 winningNumber) private view returns (uint256) {
+                  uint256 total = 0;
+                  for (uint256 i = 0; i < bets.length; i++) {
+                      if (bets[i].player == player && bets[i].number == winningNumber) {
+                          total += bets[i].amount;
+                      }
+                  }
+                  return total;
+              }
+              
+              function _generateRandomNumber() private view returns (uint256) {
+                  uint256 random = uint256(keccak256(abi.encodePacked(
+                      block.timestamp,
+                      block.prevrandao,
+                      blockhash(block.number - 1),
+                      bets.length
+                  )));
+                  return (random % (MAX_NUMBER - MIN_NUMBER + 1)) + MIN_NUMBER;
+              }
+              
+              function _startNewRound() private {
+                  delete bets;
+                  totalPrizePool = 0;
+                  roundId++;
+                  isRoundActive = true;
+              }
+              
+              function getCurrentRound() external view returns (
+                  uint256 id,
+                  uint256 totalBets,
+                  uint256 totalAmount,
+                  bool active
+              ) {
+                  return (roundId, bets.length, totalPrizePool, isRoundActive);
+              }
+              
+              function getTotalPrizePool() external view returns (uint256) {
+                  return totalPrizePool;
+              }
+          }
+    
+    deployment_scripts:
+      metadata:
+        name: 'deployment-scripts'
+        namespace: 'casino-namespace'
+      
+      data:
+        'truffle-config.js': |
+          const HDWalletProvider = require('@truffle/hdwallet-provider');
+          
+          module.exports = {
+            networks: {
+              ibm: {
+                provider: () => new HDWalletProvider(
+                  process.env.OWNER_PRIVATE_KEY,
+                  process.env.NODE_URL
+                ),
+                network_id: '*',
+                gas: 5500000,
+                gasPrice: 0,
+                confirmations: 2,
+                timeoutBlocks: 200,
+                skipDryRun: true
+              }
+            },
+            compilers: {
+              solc: {
+                version: '0.8.19',
+                settings: {
+                  optimizer: {
+                    enabled: true,
+                    runs: 200
+                  }
+                }
+              }
+            }
+          };
+        
+        '2_deploy_contracts.js': |
+          const Casino = artifacts.require('Casino');
+          
+          module.exports = async function(deployer) {
+            await deployer.deploy(Casino);
+            const casino = await Casino.deployed();
+            console.log('Casino contract deployed at:', casino.address);
+          };
